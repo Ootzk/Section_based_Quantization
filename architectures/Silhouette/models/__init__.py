@@ -1,0 +1,1 @@
+from .resnet_Silhouette import resnet18_Silhouette, resnet34_Silhouette, resnet50_Silhouette
