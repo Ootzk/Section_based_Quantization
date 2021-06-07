@@ -1,4 +1,5 @@
 from collections import namedtuple
+from typeing import Union
 
 import torch
 import torch.nn as nn
@@ -10,87 +11,165 @@ from ..common import *
 
 
 __all__ = [
-    'SilhouetteExtractor',
-    'SilhouetteEditor',
+    #'SilhouetteExtractor',
+    #'SilhouetteEditor',
+    'AttentionMapExtractor',
+    'compress_attention_map',
+    'sectionize_silhouette',
     'encode_policy',
-    'SilhouetteSectionizer', 
-    'SilhouettePredictor', 
+    #'SilhouetteSectionizer', 
+    #'SilhouettePredictor', 
+    'AuxiliaryNet',
     'SilhouetteConv2d'
 ]
         
         
         
-class SilhouetteExtractor(nn.Module):
-    def __init__(self,
-                 in_channels,
-                 out_channels,
-                 pooling_layer, 
-                 kernel_size):
+class AttentionMapExtractor(nn.Module):
+    """
+    This module will be 'installed' at the specific location of Original network, such as ResNet, MobileNet, etc.
+    Feature map at that specific location will be processed into 'Attention map', by passing simple Conv-Pool-GlobalAvgPool layer combination.
+    
+    Good explanation for 'Attention Map': https://blog.lunit.io/2018/08/30/bam-and-cbam-self-attention-modules-for-cnn/
+    
+    Args:
+        in_channels (int): # channels of Feature map that will be extracted.
+        out_channels (int): # classes of target training dataset. ex) CIFAR10: 10, ImageNet: 1000
+        conv_kernel_size (int, default=3): conv layer kernel size.
+        
+        pool_type (str, default='MaxPool2d'): type of pooling layer. supports ['AvgPool2d', 'MaxPool2d']
+        pool_kernel_size (int, default=2): pool layer kernel size.
+    """
+    def __init__(self, 
+                 in_channels: int, 
+                 out_channels: int,
+                 conv_kernel_size: int = 3,
+                 
+                 pool_type: str = 'MaxPool2d',
+                 pool_kernel_size: int = 2) -> None:
         super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
-        self.pool = self._make_pooling_layer(pooling_layer)
+        
+        assert pool_type in ['AvgPool2d', 'MaxPool2d']
+        
+        self.conv = nn.Conv2d(in_channels, out_channels, conv_kernel_size)
+        self.pool = nn.__dict__[pool_type](pool_kernel_size)
         self.globalavgpool = nn.AdaptiveAvgPool2d(output_size=(1, 1))
         
         nn.init.kaiming_normal_(self.conv.weight, mode='fan_out', nonlinearity='relu')
-        
-        
-    def _make_pooling_layer(self, pooling_layer):
-        if pooling_layer == 'avg':
-            return nn.AvgPool2d(kernel_size=2)
-        elif pooling_layer == 'max':
-            return nn.MaxPool2d(kernel_size=2)
-        else:
-            raise ImportError('Pooling layer type {0} is not supported'.format(pooling_layer))
             
             
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> tuple:
+        assert x.dim() == 4
+        
         x = self.conv(x)
         x = self.pool(x)
         a = x.detach()
         x = self.globalavgpool(x)
         y = x.squeeze()
-        return (y, a)
+        
+        out = (y, a)
+        return out
     
     
     
-class SilhouetteEditor(nn.Module):
+def compress_attention_map(a: torch.Tensor, method: str, **kwargs) -> torch.Tensor:
+    """
+    Compress attention map(extracted by AttentionMapExtractor)(size: B * C * H * W) into `silhouette`(size: B * 1 * H * W) with given method.
+    
+    Args:
+        a (torch.Tensor): attention map extracted by AttentionMapExtractor.
+        method (str): compressing method. supports ['amax', 'avg', 'topk_activation', 'topk_deviation_of_activation', 'random']
+        
+    Returns:
+        silhouette (torch.Tensor): compressed attention map with channel size = 1.
+    """
+    
+    assert isinstance(a, torch.Tensor) and a.dim() == 4
+    assert method in ['max', 'avg', 'topk_activation', 'topk_deviation_of_activation', 'random']
+    if method == 'topk_activation' or method == 'topk_deviation_of_activation':
+        assert 'k' in kwargs.keys() and isinstance(kwargs['k'], int)
+        assert kwargs['k'] > 0 and kwargs['k'] < a.size()[1]
+        
+    if method == 'max':
+        return torch.amax(a, dim=1, keepdim=True)
+    elif method == 'avg':
+        return torch.mean(a, dim=1, keepdim=True)
+    elif method == 'topk_activation':
+        indices  = torch.topk(torch.mean(a, dim=[2, 3]), k=kwargs['k'], dim=1).indices
+        selected = torch.stack([torch.index_select(batch, dim=0, index=index)
+                                for batch, index in zip(a, indices)])
+        return torch.mean(selected, dim=1, keepdim=True)
+    elif method == 'topk_deviation':
+        indices  = torch.topk(torch.std(a, dim=[2, 3]), k=kwargs['k'], dim=1).indices
+        selected = torch.stack([torch.index_select(batch, dim=0, index=index) 
+                                for batch, index in zip(a, indices)])
+        return torch.mean(selected, dim=1, keepdim=True)
+    elif method == 'random':
+        return torch.randn_like(torch.mean(a, dim=1, keepdim=True))
+    
+    
+    
+class AuxiliaryNet(nn.Module):
+    """
+    Auxiliary Network for Silhouette algorithm.
+    Extract and process feature map from Original network, and keep `Silhouette`(compressed attention map) in bank for global usage of Original network.
+    
+    Args:
+        extractor_config (dict): arguments in dict for AttentionMapExtractor.
+        compress_config  (dict): arguments in dict for compress_attention_map.
+        
+    Returns:
+        y (torch.Tensor): prediction of internal AttentionMapExtractor. size: B * nClasses.
+    """
     def __init__(self,
-                 method,
-                 **params):
+                 extractor_config: dict, 
+                 compress_config: dict) -> None:
         super().__init__()
-        assert method in ['channelwise_maximization',
-                          'topk_activation',
-                          'topk_deviation_of_activation',
-                          'random']
-        self.method = method
-        if self.method in ['topk_activation',
-                           'topk_deviation_of_activation']:
-            assert 'k' in params
-            k = params['k']
-            assert type(k) is int and k > 0
-            self.k = k
-            
-            
-    def forward(self, a):
-        assert a.dim() == 4
         
-        if self.method == 'channelwise_maximization':
-            return torch.max(a, dim=1, keepdim=True).values
-        elif self.method == 'topk_activation':
-            a = torch.stack([torch.index_select(batch, dim=0, index=index) for batch, index 
-                             in zip(a, torch.topk(torch.mean(a, dim=[2, 3]), k=self.k, dim=1).indices)])
-            a = torch.mean(a, dim=1, keepdim=True)
-            return a
-        elif self.method == 'topk_deviation_of_activation':
-            a = torch.stack([torch.index_select(batch, dim=0, index=index) for batch, index 
-                             in zip(a, torch.topk(torch.std(a, dim=[2, 3]), k=self.k, dim=1).indices)])
-            a = torch.mean(a, dim=1, keepdim=True)
-            return a
-        elif self.method == 'random':
-            return torch.randn_like(torch.mean(a, dim=1, keepdim=True))
+        self.extractor = AttentionMapExtractor(**extractor_config)
+        self.compress_config = compress_config
+        self.bank = None
+        
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y, a = self.extractor(x)
+        self.bank = compress_attention_map(a, **self.compress_config)
+        return y
+    
+    
+    
+def sectionize_silhouette(s: torch.Tensor, nbits: list, quantiles: list) -> dict:
+    """
+    Generate dictionary of masks with given silhouette and policy.
+    
+    Args:
+        s (torch.Tensor): Silhouette, i.e. compressed attention map
+        nbits (list): list of bit-width (precision). bit-width available for integer 2~8.
+        quantiles (list): list of quantile threshold value for each bit-width. should be len(quantiles) = len(nbits) - 1
+        
+    Returns:
+        masks (dict): for each bit-width, mask(torch.BoolTensor) will be generated.
+    """
+    assert s.dim() == 4 and s.size()[1] == 1
+    assert len(nbits) - 1 == len(quantiles)
+    
+    masks = {nbit: [] for nbit in nbits}
+    for i, c in enumerate(s):
+        quantile_values = torch.quantile(c.flatten(), quantiles.to(c.device), dim=0)
+        for j, nbit in enumerate(nbits):
+            if j == len(nbits) - 1:
+                masks[nbit].append(torch.ge(c, quantile_values[j]))
+            else:
+                masks[nbit].append(torch.ge(c, quantile_values[j]) & torch.lt(c, quantile_values[j + 1]))
+        masks = {nbit: torch.stack(mask, dim=0) for nbit, mask in masks.items()}
+        
+    return masks
         
         
-        
+
+"""
+Integrate as member function of SilhouetteConv2d?
+"""
 def encode_policy(policy: str):
     accum = 0
     
@@ -115,43 +194,75 @@ def encode_policy(policy: str):
 
 
 
-class SilhouetteSectionizer(nn.Module):
-    def __init__(self,
-                 policy: str):
-        super().__init__()
-        self.nbits, self.quantiles = encode_policy(policy)
-        
-        
-    def forward(self, a):
-        assert a.dim() == 4
-                
-        masks = {nbit: [] for nbit in self.nbits}
-        for i, batch in enumerate(a):
-            quantile_values = torch.quantile(batch.flatten(), self.quantiles.to(batch.device), dim=0)
-            for j, nbit in enumerate(self.nbits):
-                if j == len(self.nbits) - 1:
-                    masks[nbit].append(torch.ge(batch, quantile_values[j]))
-                else:
-                    masks[nbit].append(torch.ge(batch, quantile_values[j]) & torch.lt(batch, quantile_values[j + 1]))
-        masks = {nbit: torch.stack(mask, dim=0) for nbit, mask in masks.items()}
-        
-        return masks
+def make_silhouette_conv_layers(nbits: list,
+                                
+                                in_channels: int,
+                                out_channels: int,
+                                kernel_size: int, 
+                                stride: int, 
+                                padding: int,
+                                dilation: int,
+                                groups: int,
+                                bias: bool,
+                                
+                                weight_scaling_per_output_channel: bool,
+                                activation_scaling_per_output_channel: bool) -> nn.ModuleDict:
+    """
+    make convolution layers for each bit-width.
+    """
+    
+    conv_layers = nn.ModuleDict({})
+    for nbit in nbits: # nbit is represented as int, moduledict only accepts str keys.
+        conv_layers[str(nbit)] = qnn.QuantConv2d(in_channels,
+                                                 out_channels, 
+                                                 kernel_size,
+                                                 stride=stride,
+                                                 padding=padding,
+                                                 dilation=dilation,
+                                                 groups=groups,
+                                                 bias=bias,
+                                                 
+                                                 input_quant=Uint8ActPerTensorFloat, # generally, input_quant is deactivated
+                                                 input_bit_width=nbit,
+                                                 input_scaling_per_output_channel=activation_scaling_per_output_channel,
+                                                 
+                                                 weight_bit_width=nbit, 
+                                                 weight_scaling_per_output_channel=weight_scaling_per_output_channel)
+    
+    return conv_layers
 
+
+
+# Batch-Normalization layer per each conv-layer?
+"""
+class SilhouetteConvBn(nn.Module):
     
-    
-class SilhouettePredictor(nn.Module):
-    def __init__(self, config: dict):
+
+
+
+class SilhouetteConvBnReLU(nn.Module):
+    def __init__(self,
+                 sectioning_policy: str,
+                 
+                 in_channels: int,
+                 out_channels: int,
+                 kernel_size: int = 3,
+                 stride: int = 1,
+                 padding: int = 0,
+                 dilation: int = 1,
+                 groups: int = 1,
+                 bias: bool = False,
+                 
+                 weight_scaling_per_output_channel: bool = False, 
+                 interpolate_before_sectioning: bool = False):
         super().__init__()
-        self.extractor = SilhouetteExtractor(**config['extractor'])
-        self.editor = SilhouetteEditor(**config['editor'])
-        self.sectionizer = SilhouetteSectionizer(**config['sectionizer'])
-        
-        
-    def forward(self, x):
-        y, a = self.extractor(x)
-        a = self.editor(a)
-        m = self.sectionizer(a)
-        return y, m
+        self.sectioning_policy = sectioning_policy # to easier display for human
+        self.nbits, self.quantiles = encode_policy(sectioning_policy) # to easier calculation for computer
+        self.conv_layers = self._make_conv_layers(in_channels, out_channels, kernel_size, )
+"""     
+
+
+
     
     
 
