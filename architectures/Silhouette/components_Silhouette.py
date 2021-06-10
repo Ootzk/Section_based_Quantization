@@ -124,12 +124,12 @@ class AuxiliaryNet(nn.Module):
         
         self.extractor = AttentionMapExtractor(**extractor_config)
         self.compress_config = compress_config
-        self.bank = None
+        self.silhouette = None
         
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y, a = self.extractor(x)
-        self.bank = compress_attention_map(a, **self.compress_config)
+        self.silhouette = compress_attention_map(a, **self.compress_config)
         return y
     
     
@@ -251,6 +251,11 @@ class SilhouetteConv2d(nn.Module):
             else:
                 return {nbit: nn.functional.interpolate(m.float(), size=target_shape).bool()
                         for nbit, m in sectionize_silhouette(self.silhouette, self.nbits, self.quantiles).items()}
+            
+    
+    @property
+    def activation_bit_width(self):
+        return min(self.nbits)
             
             
     def forward(self, x: torch.Tensor):
