@@ -17,7 +17,6 @@ __all__ = [
 ]
 
 
-
 class BasicBlock(nn.Module):
     expansion = 1
     
@@ -28,21 +27,23 @@ class BasicBlock(nn.Module):
                  **kwargs):
         super().__init__()
         ConvLayer = SilhouetteConv2d if 'sectioning_policy' in kwargs else qnn.QuantConv2d
+        activation_bit_width = kwargs['activation_bit_width'] if 'activation_bit_width' in kwargs else None
         
-        self.conv1 = ConvLayer(in_channels=inplanes, out_channels=planes, kernel_size=3, stride=stride, padding=1, bias=False, **kwargs)
-        activation_bit_width = kwargs.get('activation_bit_width', self.conv1.activation_bit_width)
+        self.conv1 = ConvLayer(**kwargs, in_channels=inplanes, out_channels=planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        if activation_bit_width is None:
+            activation_bit_width = self.conv1.activation_bit_width
         self.bn1 = nn.BatchNorm2d(planes)
         self.relu1 = QuantPACTReLU(bit_width=activation_bit_width)
         
-        self.conv2 = ConvLayer(in_channels=planes, out_channels=planes, kernel_size=3, stride=1, padding=1, bias=False, **kwargs)
+        self.conv2 = ConvLayer(**kwargs, in_channels=planes, out_channels=planes, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(planes)
         self.shortcut = nn.Sequential() # identity
         if stride != 1: # not identity
             self.shortcut = nn.Sequential(
-                ConvLayer(in_channels=inplanes, planes, kernel_size=1, stride=stride, bias=False, **kwargs),
+                ConvLayer(**kwargs, in_channels=inplanes, out_channels=planes, kernel_size=1, stride=stride, bias=False),
                 nn.BatchNorm2d(planes)
             )
-        self.relu2 = QuantPACTReLU(bit_width-activation_bit_width)
+        self.relu2 = QuantPACTReLU(bit_width=activation_bit_width)
             
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -75,22 +76,24 @@ class Bottleneck(nn.Module):
                  **kwargs):
         super().__init__()
         ConvLayer = SilhouetteConv2d if 'sectioning_policy' in kwargs else qnn.QuantConv2d
+        activation_bit_width = kwargs['activation_bit_width'] if 'activation_bit_width' in kwargs else None
         
-        self.conv1 = ConvLayer(in_channels=inplanes, out_channels=planes, kernel_size=1, stride=1, padding=1, bias=False, **kwargs)
-        activation_bit_width = kwargs.get('activation_bit_width', self.conv1.activation_bit_width)
+        self.conv1 = ConvLayer(**kwargs, in_channels=inplanes, out_channels=planes, kernel_size=1, stride=1, padding=1, bias=False)
+        if activation_bit_width is None:
+            activation_bit_width = self.conv1.activation_bit_width
         self.bn1 = nn.BatchNorm2d(planes)
         self.relu1 = QuantPACTReLU(bit_width=activation_bit_width)
         
-        self.conv2 = ConvLayer(in_channels=planes, out_channels=planes, kernel_size=3, stride=stride, padding=1, bias=False, **kwargs)
+        self.conv2 = ConvLayer(**kwargs, in_channels=planes, out_channels=planes, kernel_size=3, stride=stride, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(planes)
         self.relu2 = QuantPACTReLU(bit_width=activation_bit_width)
         
-        self.conv3 = ConvLayer(in_channels=planes, out_channels=planes * self.expansion, stride=1, padding=1, bias=False, **kwargs)
+        self.conv3 = ConvLayer(**kwargs, in_channels=planes, out_channels=planes * self.expansion, stride=1, padding=1, bias=False)
         self.bn3 = nn.BatchNorm2d(planes * self.expansion)
         self.shortcut = nn.Sequential() # identity
         if stride != 1: # not identity
             self.shortcut = nn.Sequential(
-                ConvLayer(in_channels=inplanes, planes * self.expansion, kernel_size=1, stride=stride, bias=False, **kwargs),
+                ConvLayer(**kwargs, in_channels=inplanes, out_channels=planes * self.expansion, kernel_size=1, stride=stride, bias=False),
                 nn.BatchNorm2d(planes * self.expansion)
             )
         self.relu3 = QuantPACTReLU(bit_width=activation_bit_width)
@@ -122,30 +125,38 @@ class ResNet_Silhouette(nn.Module):
                  config: dict):
         super().__init__()
         
-        assert type(block) is BasicBlock or type(block) is Bottleneck
         assert len(num_blocks) == 4
         assert target_dataset in ['CIFAR10', 'CIFAR100', 'ImageNet']
         
         self.target_dataset = target_dataset
-        self.num_classes = self._get_num_classes(target_dataset)
         self.config = config
         
         self.inplanes = 64
         
         self.input_stem = self._make_input_stem()
-        self.layer1 = self._make_layer(block, num_blocks[0], 64, 1)
-        self.layer2 = self._make_layer(block, num_blocks[1], 128, 2)
-        self.layer3 = self._make_layer(block, num_blocks[2], 256, 2)
-        self.layer4 = self._make_layer(block, num_blocks[3], 512, 2)
+        self.layer1 = self._make_layer("layer1", block, num_blocks[0], 64, 1)
+        self.layer2 = self._make_layer("layer2", block, num_blocks[1], 128, 2)
+        self.layer3 = self._make_layer("layer3", block, num_blocks[2], 256, 2)
+        self.layer4 = self._make_layer("layer4", block, num_blocks[3], 512, 2)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(512 * block.expansion, self.num_classes())
+        self.fc = nn.Linear(512 * block.expansion, self.num_classes)
         
         self.w = nn.parameter.Parameter(data=torch.tensor([3.0]), requires_grad=True) # sigmoid(3.0) ~= 0.95
         self.register_buffer('sum_aux_nets_outputs', None)
         
-        self.aux_nets = self._make_aux_nets(num_blocks)
+        self.aux_nets = self._make_aux_nets()
         
         self._initialize_layers()
+        
+        
+    @property
+    def num_classes(self):
+        if self.target_dataset == 'CIFAR10':
+            return 10
+        elif self.target_dataset == 'CIFAR100':
+            return 100
+        elif self.target_dataset == 'ImageNet':
+            return 1000
         
                 
     def _initialize_layers(self):
@@ -167,19 +178,10 @@ class ResNet_Silhouette(nn.Module):
         
         def forward_aux_net(name):
             def hook(M, I):
-                self.aux_nets[name]
+                self.aux_nets[name](I[0])
             return hook
         for name, aux_config in self.config['aux_nets'].items():
             getattr(self, aux_config['trigger']).register_forward_pre_hook(forward_aux_net(name))
-            
-                
-    def _get_num_classes(self, target_dataset: str):
-        if self.target_dataset == 'CIFAR10':
-            return 10
-        elif self.target_dataset == 'CIFAR100':
-            return 100
-        elif self.target_dataset == 'ImageNet':
-            return 1000
                 
         
     def _make_input_stem(self) -> nn.Sequential:
@@ -198,16 +200,16 @@ class ResNet_Silhouette(nn.Module):
             )
         
         
-    def _make_layer(self, block: Union[BasicBlock, Bottleneck], num_block: int, planes: int, stride: int=1) -> nn.Sequential:
+    def _make_layer(self, name: str, block: Union[BasicBlock, Bottleneck], num_block: int, planes: int, stride: int=1) -> nn.Sequential:
         strides = [stride] + [1] * (num_block - 1)
         layers = []
         for stride in strides:
-            layers.append(block(self.inplanes, planes, stride))
+            layers.append(block(self.inplanes, planes, stride, **self.config['layers'][name]))
             self.inplanes = planes
         return nn.Sequential(*layers)
     
     
-    def _make_aux_nets(self, num_blocks: list) -> nn.ModuleDict:
+    def _make_aux_nets(self) -> nn.ModuleDict:
         def send_silhouette(receivers: list): # send silhouette 'after' aux_net have forwarded.
             def hook(M, I, O):
                 silhouette = M.silhouette
@@ -219,12 +221,15 @@ class ResNet_Silhouette(nn.Module):
             return hook
         
         def accumulate_output(M, I, O):
-            self.sum_aux_nets_outputs += O
+            if self.sum_aux_nets_outputs is None:
+                self.sum_aux_nets_outputs = O
+            else:
+                self.sum_aux_nets_outputs += O
             
         aux_nets = nn.ModuleDict({})
         for name, aux_config in self.config['aux_nets'].items():
-            aux_config['extractor_config']['in_channels'] = num_blocks[int(aux_config['trigger'][-1]) - 1] # 'layerN' -> num_blocks[N - 1] (N = 1, 2, 3, 4)
-            aux_net = AuxiliaryNet(aux_config['extractor_config'], aux_config['compress_config'])
+            aux_net = AuxiliaryNet(extractor_config=aux_config['extractor_config'], 
+                                   compress_config=aux_config['compress_config'])
             aux_net.register_forward_hook(send_silhouette(aux_config['receivers']))
             aux_net.register_forward_hook(accumulate_output)
             aux_nets[name] = aux_net

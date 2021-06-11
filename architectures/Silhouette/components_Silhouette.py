@@ -124,7 +124,8 @@ class AuxiliaryNet(nn.Module):
         
         self.extractor = AttentionMapExtractor(**extractor_config)
         self.compress_config = compress_config
-        self.silhouette = None
+        
+        self.register_buffer('silhouette', None)
         
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -224,7 +225,7 @@ class SilhouetteConv2d(nn.Module):
         self.nbits, self.quantiles = encode_policy(sectioning_policy) # to easier calculation for computer
         self.interpolate_before_sectioning = interpolate_before_sectioning
         
-        self.silhouette = None
+        self.register_buffer('silhouette', None)
         
         self.conv_layers = self._make_conv_layers(in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias, weight_scaling_per_output_channel)
         
