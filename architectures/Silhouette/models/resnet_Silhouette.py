@@ -175,13 +175,12 @@ class ResNet_Silhouette(nn.Module):
                 nn.init.constant_(m.bn3.weight, 0)
             elif isinstance(m, BasicBlock):
                 nn.init.constant_(m.bn2.weight, 0)
-        
-        def forward_aux_net(name):
-            def hook(M, I):
-                self.aux_nets[name](I[0])
-            return hook
-        for name, aux_config in self.config['aux_nets'].items():
-            getattr(self, aux_config['trigger']).register_forward_pre_hook(forward_aux_net(name))
+                
+
+    def _activate_aux_net(self, x: torch.Tensor, trigger: str):
+        for aux_net_name, aux_net_config in self.config['aux_nets'].items():
+            if aux_net_config['trigger'] == trigger:
+                self.aux_nets[aux_net_name](x)
                 
         
     def _make_input_stem(self) -> nn.Sequential:
@@ -241,9 +240,16 @@ class ResNet_Silhouette(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.input_stem(x)
         
+        self._activate_aux_net(x, 'layer1')
         x = self.layer1(x)
+        
+        self._activate_aux_net(x, 'layer2')
         x = self.layer2(x)
+        
+        self._activate_aux_net(x, 'layer3')
         x = self.layer3(x)
+        
+        self._activate_aux_net(x, 'layer4')
         x = self.layer4(x)
         
         x = self.avgpool(x)
