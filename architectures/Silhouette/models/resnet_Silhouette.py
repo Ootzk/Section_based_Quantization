@@ -180,7 +180,14 @@ class ResNet_Silhouette(nn.Module):
     def _activate_aux_net(self, x: torch.Tensor, trigger: str):
         for aux_net_name, aux_net_config in self.config['aux_nets'].items():
             if aux_net_config['trigger'] == trigger:
-                self.aux_nets[aux_net_name](x)
+                if self.sum_aux_nets_outputs is None:
+                    self.sum_aux_nets_outputs = self.aux_nets[aux_net_name](x)
+                else:
+                    self.sum_aux_nets_outputs += self.aux_nets[aux_net_name](x)
+                    
+                for m in getattr(self, trigger).modules():
+                    if isinstance(m, SilhouetteConv2d):
+                        m.silhouette = self.aux_nets[aux_net_name].silhouette
                 
         
     def _make_input_stem(self) -> nn.Sequential:
@@ -209,28 +216,10 @@ class ResNet_Silhouette(nn.Module):
     
     
     def _make_aux_nets(self) -> nn.ModuleDict:
-        def send_silhouette(receivers: list): # send silhouette 'after' aux_net have forwarded.
-            def hook(M, I, O):
-                silhouette = M.silhouette
-                for receiver in receivers:
-                    for m in getattr(self, receiver).modules():
-                        if isinstance(m, SilhouetteConv2d):
-                            m.silhouette = silhouette
-                M.silhouette = None
-            return hook
-        
-        def accumulate_output(M, I, O):
-            if self.sum_aux_nets_outputs is None:
-                self.sum_aux_nets_outputs = O
-            else:
-                self.sum_aux_nets_outputs += O
-            
         aux_nets = nn.ModuleDict({})
         for name, aux_config in self.config['aux_nets'].items():
             aux_net = AuxiliaryNet(extractor_config=aux_config['extractor_config'], 
                                    compress_config=aux_config['compress_config'])
-            aux_net.register_forward_hook(send_silhouette(aux_config['receivers']))
-            aux_net.register_forward_hook(accumulate_output)
             aux_nets[name] = aux_net
             
         return aux_nets
