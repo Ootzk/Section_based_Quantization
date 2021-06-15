@@ -14,6 +14,8 @@ import seaborn as sns
 import torch
 from torchvision.transforms import Normalize
 
+import architectures
+
 plt.rcParams['figure.facecolor']  = 'white'
 plt.rcParams['savefig.facecolor'] = 'white'
 
@@ -90,38 +92,45 @@ def integrate_mask(mask):
     
     
     
-def load_model(experiment_dir, checkpoint=None):
+def load_model(experiment_dir, checkpoint=None, verbose=False):
     if not experiment_dir.startswith('experiments/'):
         experiment_dir = f'experiments/{experiment_dir}'
         
     with open(f'{experiment_dir}/config.json', 'r') as exp_config_file:
         exp_config = json.load(exp_config_file)
-        
-    print('experiment configuration: ')
-    pprint.pprint(exp_config)
+    
+    if verbose:
+        print('experiment configuration: ')
+        pprint.pprint(exp_config)
         
     try:
-        archived_arch = importlib.import_module(f'{experiment_dir.replace('/', '.')}.architectures')
+        archived_arch = importlib.import_module(f'{experiment_dir.replace("/", ".")}.architectures')
     except ModuleNotFoundError:
-        print('archived architecture: (X), archived model loader: (X)\n')
+        if verbose:
+            print('archived architecture: (X), archived model loader: (X)\n')
         model = architectures.get_model_skeleton(exp_config['model'], exp_config['dataloader']['dataset'])
     else:
         try:
             model = archived_arch.get_model_skeleton(exp_config['model'], exp_config['dataloader']['dataset'])
-            print('archived architecture: (O), archived model loader: (O)\n')
+            if verbose:
+                print('archived architecture: (O), archived model loader: (O)\n')
         except:
             model = architectures.get_model_skeleton(exp_config['model'], exp_config['dataloader']['dataset'])
-            print('archived architecture: (O), archived model loader: (X)\n')
+            if verbose:
+                print('archived architecture: (O), archived model loader: (X)\n')
                 
     if checkpoint is None:
-        print(f'checkpoint: not specified')
+        if verbose:
+            print(f'checkpoint: not specified')
         return model, exp_config
     else:
         for candidate in os.listdir(f'{experiment_dir}/checkpoints/'):
             if candidate.startswith(f'checkpoint_{checkpoint}_'):
                 model.load_state_dict(torch.load(f'{experiment_dir}/checkpoints/{candidate}')['model'])
-                print(f'checkpoint: epoch @ {checkpoint} loaded successfully')
+                if verbose:
+                    print(f'checkpoint: epoch @ {checkpoint} loaded successfully')
                 return model, exp_config
         
-        print(f'checkpoint: epoch @ {checkpoint} but not searched')
+        if verbose:
+            print(f'checkpoint: epoch @ {checkpoint} but not searched')
         return model, exp_config
