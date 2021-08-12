@@ -175,7 +175,7 @@ def encode_policy(policy: str):
 
 class Silhouette_v2_Conv2d(nn.Module):
     def __init__(self,
-                 threshold: int = 0.1, 
+                 threshold: int, 
                 
                  in_channels: int,
                  out_channels: int,
@@ -189,7 +189,21 @@ class Silhouette_v2_Conv2d(nn.Module):
                  weight_scaling_per_output_channel: bool = False,
                  interpolate_before_sectioning: bool = False):
         super().__init__()
+        self.threshold = threshold
         
         
     def forward(self, x: torch.Tensor):
+        mask = torch.mean(x, dim=[2, 3]).ge(self.threshold)
         
+        
+        
+        
+        for i, (batch, batch_mask) in enumerate(zip(x, mask)):
+            for j, (channel, boolean) in enumerate(zip(batch, batch_mask)):
+                
+                
+                print(f'one channel\'s size: {channel.shape}, corresponding boolean: {boolean}')
+        
+        
+        
+        return mask
