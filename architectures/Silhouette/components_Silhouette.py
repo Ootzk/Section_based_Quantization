@@ -191,16 +191,20 @@ def sectionize_silhouette(s: torch.Tensor, nbits: list, quantiles: list) -> dict
     assert len(nbits) == len(quantiles)
     
     masks = {nbit: [] for nbit in nbits}
+    quantile_values = {nbit: [] for nbit in nbits}
     for i, c in enumerate(s):
-        quantile_values = torch.quantile(c.flatten(), quantiles.to(c.device), dim=0)
+        qvs = torch.quantile(c.flatten(), quantiles.to(c.device), dim=0)
         for j, nbit in enumerate(nbits):
             if j == len(nbits) - 1:
-                masks[nbit].append(torch.ge(c, quantile_values[j]))
+                masks[nbit].append(torch.ge(c, qvs[j]))
+                quantile_values[nbit].append(qvs[j])
             else:
-                masks[nbit].append(torch.ge(c, quantile_values[j]) & torch.lt(c, quantile_values[j + 1]))
+                masks[nbit].append(torch.ge(c, qvs[j]) & torch.lt(c, qvs[j + 1]))
+                quantile_values[nbit].append(qvs[j])
     masks = {nbit: torch.stack(mask, dim=0) for nbit, mask in masks.items()}
+    quantile_values = {nbit: torch.stack(qv, dim=0) for nbit, qv in quantile_values.items()}
         
-    return masks
+    return masks, quantile_values
 
 
 
@@ -250,8 +254,9 @@ class SilhouetteConv2d(nn.Module):
             if self.interpolate_before_sectioning:
                 return sectionize_silhouette(nn.functional.interpolate(self.silhouette, size=target_shape), self.nbits, self.quantiles)
             else:
-                return {nbit: nn.functional.interpolate(m.float(), size=target_shape).bool()
-                        for nbit, m in sectionize_silhouette(self.silhouette, self.nbits, self.quantiles).items()}
+                masks, quantile_values = sectionize_silhouette(self.silhouette, self.nbits, self.quantiles)
+                masks = {nbit: nn.functional.interpolate(m.float(), size=target_shape).bool() for nbit, m in masks.items()}
+                return masks, quantile_values
             
     
     @property
@@ -259,15 +264,22 @@ class SilhouetteConv2d(nn.Module):
         return min(self.nbits)
             
             
-    def forward(self, x: torch.Tensor):
-        masks = self._generate_masks(x.shape[-2:])
+    def forward(self, x: torch.Tensor, debug: False):
+        masks, quantile_values = self._generate_masks(x.shape[-2:])
         
         if masks is None:
             return self.conv_layers[str(max(self.nbits))](x)
         else:
+            x_quants = {}
             y_quants = {}
             for nbit, conv in self.conv_layers.items():
-                x_quant = x.masked_fill(~masks[int(nbit)], 1e-5)
-                y_quants[nbit] = conv(x_quant)
+                x_quants[nbit] = x.clone()
+                for i, (mask, qv) in enumerate(zip(masks[int(nbit)], quantile_values[int(nbit)])):
+                    x_quants[nbit][i].masked_fill(~mask, qv)
+                y_quants[nbit] = conv(x_quants[nbit])
             y = sum(y_quants.values())
-            return y
+            
+            if debug:
+                return y, x_quants
+            else:
+                return y
