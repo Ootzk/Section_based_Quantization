@@ -218,7 +218,7 @@ class SilhouetteConv2d(nn.Module):
             silhouette = self.silhouette
             
         masks = {nbit: [] for nbit in self.nbits}
-        for i, c in enumerate(self.silhouette):
+        for i, c in enumerate(silhouette):
             quantile_values = torch.quantile(c.flatten(), self.quantiles.to(c.device), dim=0)            
             for j, nbit in enumerate(self.nbits):
                 if j == len(self.nbits) - 1:
@@ -260,8 +260,7 @@ class SilhouetteConv2d(nn.Module):
         if masks is None:
             return self.conv_layers[str(max(self.nbits))](x)
         
-        if debug:
-            x_quants = {nbit: [] for nbit in self.nbits}
+        x_quants = {nbit: [] for nbit in self.nbits}
         y_quants = {nbit: [] for nbit in self.nbits}
         for i, (nbit, conv) in enumerate(self.conv_layers.items()):
             nbit = int(nbit)
@@ -269,13 +268,10 @@ class SilhouetteConv2d(nn.Module):
                 mask = mask.squeeze()
                 x_quant = []
                 for x_img in x_channel:
-                    print(f'x_img shape: {x_img.shape}, mask shape: {mask.shape}')
                     quantile_values = torch.quantile(x_img.flatten(), self.quantiles.to(x_img.device), dim=0)
                     x_quant.append(x_img.masked_fill(~mask, quantile_values[i]))
-                if debug:
-                    x_quants[nbit].append(torch.stack(x_quant, dim=0))
-            if debug:
-                x_quants[nbit] = torch.stack(x_quants[nbit], dim=0)
+                x_quants[nbit].append(torch.stack(x_quant, dim=0))
+            x_quants[nbit] = torch.stack(x_quants[nbit], dim=0)
             y_quants[nbit] = conv(x_quants[nbit])
         y = sum(y_quants.values())
         
