@@ -1,5 +1,5 @@
 from collections import namedtuple
-from typing import Union
+from typing import Union, Optional
 
 import torch
 import torch.nn as nn
@@ -14,8 +14,6 @@ __all__ = [
     'AttentionMapExtractor',
     'compress_attention_map',
     'AuxiliaryNet',
-    'encode_policy',
-    'sectionize_silhouette',
     'SilhouetteConv2d'
 ]
         
@@ -132,79 +130,6 @@ class AuxiliaryNet(nn.Module):
         y, a = self.extractor(x)
         self.silhouette = compress_attention_map(a, **self.compress_config)
         return y
-    
-    
-    
-def encode_policy(policy: str):
-    """
-    Translate human-friendly sectioning policy to computer-friendly combination of lists.
-    
-    Examples:
-        '2bit 50%, 3bit 30%, 4bit 20%' -> ([2, 3, 4], [0.0, 0.5, 0.8])
-        
-    Args:
-        policy (str): human-friendly sectioning policy. percentiles in front will be assigned to low-value spectrum.
-        
-    Returns:
-        tuple that includes...
-            nbits (list): target precisions.
-            quantiles (list): threshold quantile for each nbit in nbits.
-    """
-    accum = 0
-    
-    nbits = []
-    quantiles = [0.0]
-        
-    for token in policy.split(', '):
-        (Nbit, Xpercentage) = token.split(' ')
-        
-        N = int(Nbit.replace('bit', '')); assert N > 0
-        X = int(Xpercentage.replace('%', '')); assert X > 0
-        
-        accum += X
-        nbits.append(N)
-        quantiles.append(accum/100)
-
-    assert accum == 100
-    quantiles.pop() # remove last one: 1.0
-    quantiles = torch.tensor(quantiles)
-    
-    return (nbits, quantiles)
-    
-    
-    
-def sectionize_silhouette(s: torch.Tensor, nbits: list, quantiles: list) -> dict:
-    """
-    Generate dictionary of masks with given silhouette and policy.
-    
-    Args:
-        s (torch.Tensor): Silhouette, i.e. compressed attention map
-        nbits (list): list of bit-width (precision). bit-width available for integer 2~8.
-        quantiles (list): list of quantile threshold value for each bit-width.
-        
-    Returns:
-        masks (dict): for each bit-width, mask(torch.BoolTensor) will be generated.
-    """
-    assert s.dim() == 4 and s.size()[1] == 1
-    assert all(nbit >= 2 and nbit <= 8 for nbit in nbits)
-    assert all(quantile >= 0.0 and quantile <= 1.0 for quantile in quantiles)
-    assert len(nbits) == len(quantiles)
-    
-    masks = {nbit: [] for nbit in nbits}
-    quantile_values = {nbit: [] for nbit in nbits}
-    for i, c in enumerate(s):
-        qvs = torch.quantile(c.flatten(), quantiles.to(c.device), dim=0)
-        for j, nbit in enumerate(nbits):
-            if j == len(nbits) - 1:
-                masks[nbit].append(torch.ge(c, qvs[j]))
-                quantile_values[nbit].append(qvs[j])
-            else:
-                masks[nbit].append(torch.ge(c, qvs[j]) & torch.lt(c, qvs[j + 1]))
-                quantile_values[nbit].append(qvs[j])
-    masks = {nbit: torch.stack(mask, dim=0) for nbit, mask in masks.items()}
-    quantile_values = {nbit: torch.stack(qv, dim=0) for nbit, qv in quantile_values.items()}
-        
-    return masks, quantile_values
 
 
 
@@ -226,7 +151,7 @@ class SilhouetteConv2d(nn.Module):
         super().__init__()
         
         self.sectioning_policy = sectioning_policy # to easier display for human
-        self.nbits, self.quantiles = encode_policy(sectioning_policy) # to easier calculation for computer
+        self.nbits, self.quantiles = self._interpret_sectioning_policy(sectioning_policy) # to easier calculation for computer
         self.interpolate_before_sectioning = interpolate_before_sectioning
         
         self.register_buffer('silhouette', None, persistent=False)
@@ -234,7 +159,85 @@ class SilhouetteConv2d(nn.Module):
         self.conv_layers = self._make_conv_layers(in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias, weight_scaling_per_output_channel)
         
         
-    def _make_conv_layers(self, in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias, weight_scaling_per_output_channel):
+    def _interpret_sectioning_policy(self, policy: str) -> tuple:
+        """
+        Translate human-friendly sectioning policy to computer-friendly combination of lists.
+
+        Examples:
+            '2bit 50%, 3bit 30%, 4bit 20%' -> ([2, 3, 4], torch.tensor([0.0, 0.5, 0.8]))
+
+        Args:
+            policy (str): human-friendly sectioning policy. percentiles in front will be assigned to low-value spectrum.
+
+        Returns:
+            tuple that includes...
+                nbits (list): target precisions.
+                quantiles (torch.Tensor): threshold quantile for each nbit in nbits.
+        """
+        accum = 0
+
+        nbits = []
+        quantiles = [0.0]
+
+        for token in policy.split(', '):
+            (Nbit, Xpercentage) = token.split(' ')
+
+            N = int(Nbit.replace('bit', '')); assert N > 0
+            X = int(Xpercentage.replace('%', '')); assert X > 0
+
+            accum += X
+            nbits.append(N)
+            quantiles.append(accum/100)
+
+        assert accum == 100
+        quantiles.pop() # remove last one: 1.0
+        quantiles = torch.tensor(quantiles)
+
+        return (nbits, quantiles)
+        
+        
+    def _generate_masks(self, target_shape) -> Optional[dict]:
+        """
+        Generate dictionary of masks with saved silhouette and sectioning_policy.
+        
+        Returns:
+            masks (dict): for each bit-width, mask(torch.BoolTensor) will be generated.
+        """
+        if self.silhouette is None:
+            return None
+        
+        assert self.silhouette.dim() == 4 and self.silhouette.shape[1] == 1
+        assert all(nbit >= 2 and nbit <= 8 for nbit in self.nbits)
+        assert all(quantile >= 0.0 and quantile <= 1.0 for quantile in self.quantiles)
+        assert len(self.nbits) == len(self.quantiles)
+        
+        silhouette = None
+        if self.interpolate_before_sectioning:
+            silhouette = nn.functional.interpolate(self.silhouette, size=target_shape)
+        else:
+            silhouette = self.silhouette
+            
+        masks = {nbit: [] for nbit in self.nbits}
+        for i, c in enumerate(self.silhouette):
+            quantile_values = torch.quantile(c.flatten(), self.quantiles.to(c.device), dim=0)            
+            for j, nbit in enumerate(self.nbits):
+                if j == len(self.nbits) - 1:
+                    masks[nbit].append(torch.ge(c, quantile_values[j]))
+                else:
+                    masks[nbit].append(torch.ge(c, quantile_values[j]) & torch.lt(c, quantile_values[j + 1]))
+        masks = {nbit: torch.stack(mask, dim=0) for nbit, mask in masks.items()}
+        
+        if self.interpolate_before_sectioning:
+            return masks
+        else:
+            return {nbit: nn.functional.interpolate(m.float(), size=target_shape).bool() for nbit, m in masks.items()}
+        
+        
+        
+    def _make_conv_layers(self, in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias, weight_scaling_per_output_channel) -> nn.ModuleDict:
+        """
+        Create series of qnn.QuantConv2d layers included in sectioning_policy and returns as nn.ModuleDict.
+        """
         conv_layers = nn.ModuleDict({})
         for nbit in self.nbits: # nbit is represented as int, moduledict only accepts str keys.
             conv_layers[str(nbit)] = qnn.QuantConv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, dilation=dilation, groups=groups, bias=bias,
@@ -245,41 +248,38 @@ class SilhouetteConv2d(nn.Module):
                                                      weight_bit_width=nbit, 
                                                      weight_scaling_per_output_channel=weight_scaling_per_output_channel)
         return conv_layers
-        
-        
-    def _generate_masks(self, target_shape):
-        if self.silhouette is None:
-            return None
-        else:
-            if self.interpolate_before_sectioning:
-                return sectionize_silhouette(nn.functional.interpolate(self.silhouette, size=target_shape), self.nbits, self.quantiles)
-            else:
-                masks, quantile_values = sectionize_silhouette(self.silhouette, self.nbits, self.quantiles)
-                masks = {nbit: nn.functional.interpolate(m.float(), size=target_shape).bool() for nbit, m in masks.items()}
-                return masks, quantile_values
-            
+    
     
     @property
     def activation_bit_width(self):
         return min(self.nbits)
-            
-            
-    def forward(self, x: torch.Tensor, debug: False):
-        masks, quantile_values = self._generate_masks(x.shape[-2:])
-        
+    
+    
+    def forward(self, x: torch.Tensor, debug: bool = False):
+        masks = self._generate_masks(x.shape[-2:])
         if masks is None:
             return self.conv_layers[str(max(self.nbits))](x)
-        else:
-            x_quants = {}
-            y_quants = {}
-            for nbit, conv in self.conv_layers.items():
-                x_quants[nbit] = x.clone()
-                for i, (mask, qv) in enumerate(zip(masks[int(nbit)], quantile_values[int(nbit)])):
-                    x_quants[nbit][i].masked_fill(~mask, qv)
-                y_quants[nbit] = conv(x_quants[nbit])
-            y = sum(y_quants.values())
-            
+        
+        if debug:
+            x_quants = {nbit: [] for nbit in self.nbits}
+        y_quants = {nbit: [] for nbit in self.nbits}
+        for i, (nbit, conv) in enumerate(self.conv_layers.items()):
+            nbit = int(nbit)
+            for x_channel, mask in zip(x, masks[nbit]):
+                mask = mask.squeeze()
+                x_quant = []
+                for x_img in x_channel:
+                    print(f'x_img shape: {x_img.shape}, mask shape: {mask.shape}')
+                    quantile_values = torch.quantile(x_img.flatten(), self.quantiles.to(x_img.device), dim=0)
+                    x_quant.append(x_img.masked_fill(~mask, quantile_values[i]))
+                if debug:
+                    x_quants[nbit].append(torch.stack(x_quant, dim=0))
             if debug:
-                return y, x_quants
-            else:
-                return y
+                x_quants[nbit] = torch.stack(x_quants[nbit], dim=0)
+            y_quants[nbit] = conv(x_quants[nbit])
+        y = sum(y_quants.values())
+        
+        if debug:
+            return y, x_quants
+        else:
+            return y
