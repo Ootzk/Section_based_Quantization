@@ -264,14 +264,12 @@ class SilhouetteConv2d(nn.Module):
         y_quants = {nbit: [] for nbit in self.nbits}
         for i, (nbit, conv) in enumerate(self.conv_layers.items()):
             nbit = int(nbit)
+            x_quant = []
             for x_channel, mask in zip(x, masks[nbit]):
                 mask = mask.squeeze()
-                x_quant = []
-                for x_img in x_channel:
-                    quantile_values = torch.quantile(x_img.flatten(), self.quantiles.to(x_img.device), dim=0)
-                    x_quant.append(x_img.masked_fill(~mask, quantile_values[i]))
-                x_quants[nbit].append(torch.stack(x_quant, dim=0))
-            x_quants[nbit] = torch.stack(x_quants[nbit], dim=0)
+                quantile_values = torch.quantile(x_channel.flatten(), self.quantiles.to(x_channel.device), dim=0)
+                x_quant.append(x_channel.masked_fill(~mask, quantile_values[i]))
+            x_quants[nbit] = torch.stack(x_quant, dim=0)
             y_quants[nbit] = conv(x_quants[nbit])
         y = sum(y_quants.values())
         
