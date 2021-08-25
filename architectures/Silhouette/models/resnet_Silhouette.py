@@ -26,21 +26,21 @@ class BasicBlock(nn.Module):
                  stride: int=1,
                  **kwargs):
         super().__init__()
-        ConvLayer = SilhouetteConv2d if 'sectioning_policy' in kwargs else qnn.QuantConv2d
+        ConvLayer = SilhouetteConv2d if 'threshold' in kwargs else qnn.QuantConv2d
         activation_bit_width = kwargs['activation_bit_width'] if 'activation_bit_width' in kwargs else None
         
-        self.conv1 = ConvLayer(**kwargs, in_channels=inplanes, out_channels=planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.conv1 = ConvLayer(in_channels=inplanes, out_channels=planes, kernel_size=3, stride=stride, padding=1, bias=False, **kwargs)
         if activation_bit_width is None:
             activation_bit_width = self.conv1.activation_bit_width
         self.bn1 = nn.BatchNorm2d(planes)
         self.relu1 = QuantPACTReLU(bit_width=activation_bit_width)
         
-        self.conv2 = ConvLayer(**kwargs, in_channels=planes, out_channels=planes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.conv2 = ConvLayer(in_channels=planes, out_channels=planes, kernel_size=3, stride=1, padding=1, bias=False, **kwargs)
         self.bn2 = nn.BatchNorm2d(planes)
         self.shortcut = nn.Sequential() # identity
         if stride != 1: # not identity
             self.shortcut = nn.Sequential(
-                ConvLayer(**kwargs, in_channels=inplanes, out_channels=planes, kernel_size=1, stride=stride, bias=False),
+                ConvLayer(in_channels=inplanes, out_channels=planes, kernel_size=1, stride=stride, bias=False, **kwargs),
                 nn.BatchNorm2d(planes)
             )
         self.relu2 = QuantPACTReLU(bit_width=activation_bit_width)
@@ -78,22 +78,22 @@ class Bottleneck(nn.Module):
         ConvLayer = SilhouetteConv2d if 'sectioning_policy' in kwargs else qnn.QuantConv2d
         activation_bit_width = kwargs['activation_bit_width'] if 'activation_bit_width' in kwargs else None
         
-        self.conv1 = ConvLayer(**kwargs, in_channels=inplanes, out_channels=planes, kernel_size=1, stride=1, padding=1, bias=False)
+        self.conv1 = ConvLayer(in_channels=inplanes, out_channels=planes, kernel_size=1, stride=1, padding=1, bias=False, **kwargs)
         if activation_bit_width is None:
             activation_bit_width = self.conv1.activation_bit_width
         self.bn1 = nn.BatchNorm2d(planes)
         self.relu1 = QuantPACTReLU(bit_width=activation_bit_width)
         
-        self.conv2 = ConvLayer(**kwargs, in_channels=planes, out_channels=planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.conv2 = ConvLayer(in_channels=planes, out_channels=planes, kernel_size=3, stride=stride, padding=1, bias=False, **kwargs)
         self.bn2 = nn.BatchNorm2d(planes)
         self.relu2 = QuantPACTReLU(bit_width=activation_bit_width)
         
-        self.conv3 = ConvLayer(**kwargs, in_channels=planes, out_channels=planes * self.expansion, stride=1, padding=1, bias=False)
+        self.conv3 = ConvLayer(in_channels=planes, out_channels=planes * self.expansion, stride=1, padding=1, bias=False, **kwargs)
         self.bn3 = nn.BatchNorm2d(planes * self.expansion)
         self.shortcut = nn.Sequential() # identity
         if stride != 1: # not identity
             self.shortcut = nn.Sequential(
-                ConvLayer(**kwargs, in_channels=inplanes, out_channels=planes * self.expansion, kernel_size=1, stride=stride, bias=False),
+                ConvLayer(in_channels=inplanes, out_channels=planes * self.expansion, kernel_size=1, stride=stride, bias=False, **kwargs),
                 nn.BatchNorm2d(planes * self.expansion)
             )
         self.relu3 = QuantPACTReLU(bit_width=activation_bit_width)
@@ -141,11 +141,6 @@ class ResNet_Silhouette(nn.Module):
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(512 * block.expansion, self.num_classes)
         
-        self.w = nn.parameter.Parameter(data=torch.tensor([3.0]), requires_grad=True) # sigmoid(3.0) ~= 0.95
-        self.register_buffer('sum_aux_nets_outputs', None)
-        
-        self.aux_nets = self._make_aux_nets()
-        
         self._initialize_layers()
         
         
@@ -176,19 +171,6 @@ class ResNet_Silhouette(nn.Module):
             elif isinstance(m, BasicBlock):
                 nn.init.constant_(m.bn2.weight, 0)
                 
-
-    def _activate_aux_net(self, x: torch.Tensor, trigger: str):
-        for aux_net_name, aux_net_config in self.config['aux_nets'].items():
-            if aux_net_config['trigger'] == trigger:
-                if self.sum_aux_nets_outputs is None:
-                    self.sum_aux_nets_outputs = self.aux_nets[aux_net_name](x)
-                else:
-                    self.sum_aux_nets_outputs += self.aux_nets[aux_net_name](x)
-                    
-                for m in getattr(self, trigger).modules():
-                    if isinstance(m, SilhouetteConv2d):
-                        m.silhouette = self.aux_nets[aux_net_name].silhouette
-                
         
     def _make_input_stem(self) -> nn.Sequential:
         if self.target_dataset == 'ImageNet':
@@ -209,47 +191,26 @@ class ResNet_Silhouette(nn.Module):
     def _make_layer(self, name: str, block: Union[BasicBlock, Bottleneck], num_block: int, planes: int, stride: int=1) -> nn.Sequential:
         strides = [stride] + [1] * (num_block - 1)
         layers = []
-        for stride in strides:
-            layers.append(block(self.inplanes, planes, stride, **self.config['layers'][name]))
+        for i, stride in enumerate(strides, 1):
+            layers.append(block(inplanes=self.inplanes, planes=planes, stride=stride, **self.config['layers'][name]))
             self.inplanes = planes
         return nn.Sequential(*layers)
-    
-    
-    def _make_aux_nets(self) -> nn.ModuleDict:
-        aux_nets = nn.ModuleDict({})
-        for name, aux_config in self.config['aux_nets'].items():
-            aux_net = AuxiliaryNet(extractor_config=aux_config['extractor_config'], 
-                                   compress_config=aux_config['compress_config'])
-            aux_nets[name] = aux_net
-            
-        return aux_nets
     
     
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.input_stem(x)
         
-        self._activate_aux_net(x, 'layer1')
         x = self.layer1(x)
-        
-        self._activate_aux_net(x, 'layer2')
         x = self.layer2(x)
-        
-        self._activate_aux_net(x, 'layer3')
         x = self.layer3(x)
-        
-        self._activate_aux_net(x, 'layer4')
         x = self.layer4(x)
         
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
-        y_main = self.fc(x)
+        y = self.fc(x)
         
-        w = torch.sigmoid(self.w)
-        y_pred = w * y_main + (1 - w) * self.sum_aux_nets_outputs
-        self.sum_aux_nets_outputs = None
-        
-        return y_pred
+        return y
     
     
     
