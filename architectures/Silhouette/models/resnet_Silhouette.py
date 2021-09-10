@@ -6,7 +6,6 @@ import brevitas
 import brevitas.nn as qnn
 
 from ..components_Silhouette import *
-from ...common import QuantPACTReLU
 
 
 __all__ = [
@@ -26,14 +25,15 @@ class BasicBlock(nn.Module):
                  stride: int=1,
                  **kwargs):
         super().__init__()
-        ConvLayer = SilhouetteConv2d if 'threshold' in kwargs else qnn.QuantConv2d
+        ConvLayer = qnn.QuantConv2d
+        theta = kwargs['theta']
         activation_bit_width = kwargs['activation_bit_width'] if 'activation_bit_width' in kwargs else None
         
         self.conv1 = ConvLayer(in_channels=inplanes, out_channels=planes, kernel_size=3, stride=stride, padding=1, bias=False, **kwargs)
         if activation_bit_width is None:
             activation_bit_width = self.conv1.activation_bit_width
         self.bn1 = nn.BatchNorm2d(planes)
-        self.relu1 = QuantPACTReLU(bit_width=activation_bit_width)
+        self.relu1 = QuantSilhouetteReLU(bit_width=activation_bit_width, theta=theta)
         
         self.conv2 = ConvLayer(in_channels=planes, out_channels=planes, kernel_size=3, stride=1, padding=1, bias=False, **kwargs)
         self.bn2 = nn.BatchNorm2d(planes)
@@ -43,7 +43,7 @@ class BasicBlock(nn.Module):
                 ConvLayer(in_channels=inplanes, out_channels=planes, kernel_size=1, stride=stride, bias=False, **kwargs),
                 nn.BatchNorm2d(planes)
             )
-        self.relu2 = QuantPACTReLU(bit_width=activation_bit_width)
+        self.relu2 = QuantSilhouetteReLU(bit_width=activation_bit_width, theta=theta)
             
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -75,18 +75,19 @@ class Bottleneck(nn.Module):
                  stride: int=1,
                  **kwargs):
         super().__init__()
-        ConvLayer = SilhouetteConv2d if 'sectioning_policy' in kwargs else qnn.QuantConv2d
+        ConvLayer = qnn.QuantConv2d
+        theta = kwargs['theta']
         activation_bit_width = kwargs['activation_bit_width'] if 'activation_bit_width' in kwargs else None
         
         self.conv1 = ConvLayer(in_channels=inplanes, out_channels=planes, kernel_size=1, stride=1, padding=1, bias=False, **kwargs)
         if activation_bit_width is None:
             activation_bit_width = self.conv1.activation_bit_width
         self.bn1 = nn.BatchNorm2d(planes)
-        self.relu1 = QuantPACTReLU(bit_width=activation_bit_width)
+        self.relu1 = QuantSilhouetteReLU(bit_width=activation_bit_width, theta=theta)
         
         self.conv2 = ConvLayer(in_channels=planes, out_channels=planes, kernel_size=3, stride=stride, padding=1, bias=False, **kwargs)
         self.bn2 = nn.BatchNorm2d(planes)
-        self.relu2 = QuantPACTReLU(bit_width=activation_bit_width)
+        self.relu2 = QuantSilhouetteReLU(bit_width=activation_bit_width, theta=theta)
         
         self.conv3 = ConvLayer(in_channels=planes, out_channels=planes * self.expansion, stride=1, padding=1, bias=False, **kwargs)
         self.bn3 = nn.BatchNorm2d(planes * self.expansion)
@@ -96,7 +97,7 @@ class Bottleneck(nn.Module):
                 ConvLayer(in_channels=inplanes, out_channels=planes * self.expansion, kernel_size=1, stride=stride, bias=False, **kwargs),
                 nn.BatchNorm2d(planes * self.expansion)
             )
-        self.relu3 = QuantPACTReLU(bit_width=activation_bit_width)
+        self.relu3 = QuantSilhouetteReLU(bit_width=activation_bit_width, theta=theta)
         
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -177,14 +178,14 @@ class ResNet_Silhouette(nn.Module):
             return nn.Sequential(
                 nn.Conv2d(3, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False),
                 nn.BatchNorm2d(self.inplanes),
-                QuantPACTReLU(bit_width=8),
+                nn.ReLU(),
                 nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
             )
         else:
             return nn.Sequential(
                 nn.Conv2d(3, self.inplanes, kernel_size=3, stride=1, padding=1, bias=False),
                 nn.BatchNorm2d(self.inplanes),
-                QuantPACTReLU(bit_width=8)
+                nn.ReLU()
             )
         
         

@@ -6,52 +6,60 @@ import torch.nn as nn
 import brevitas
 import brevitas.nn as qnn
 from brevitas.quant.scaled_int import Uint8ActPerTensorFloat
+from brevitas.nn.quant_layer import QuantNonLinearActLayer as QuantNLAL
 
 from ..common import *
 
 
 __all__ = [
-    'SilhouetteConv2d'
+    'SilhouetteReLU',
+    'QuantSilhouetteReLU'
 ]
-  
+
+
+
+class SilhouetteActivation(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, theta: nn.Parameter):
+        mask = torch.ge(torch.std(x, dim=[2, 3]), theta)
+        x[~mask] = 0
+        ctx.save_for_backward(mask, theta)
+        return x
+    
+    @staticmethod
+    def backward(ctx, dy: torch.Tensor):
+        mask, theta, = ctx.saved_tensors
+        dx = dy.clone()
+        dx[~mask] = 0
+        dtheta = torch.mean(dx)
+        return dx, dtheta
     
     
-class SilhouetteConv2d(nn.Module):
-    def __init__(self, 
-                 in_channels: int,
-                 out_channels: int,
-                 kernel_size: int = 3,
-                 stride: int = 1,
-                 padding: int = 0,
-                 dilation: int = 1,
-                 groups: int = 1,
-                 bias: bool = False,
-                 
-                 threshold: float = 0.1,
-                 activation_bit_width: int = 8,
-                 weight_bit_width: int = 8,
-                 weight_scaling_per_output_channel: bool = False,
-                 interpolate_before_sectioning: bool = False):
+    
+class SilhouetteReLU(nn.Module):
+    def __init__(self,
+                 theta: float = 0.1):
         super().__init__()
-        self.interpolate_before_sectioning = interpolate_before_sectioning
-        self.threshold = nn.Parameter(torch.tensor(threshold, requires_grad=True))
+        self.theta = nn.Parameter(torch.tensor(theta, requires_grad=True))
         
-        self.conv_layer = qnn.QuantConv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, dilation=dilation, groups=groups, bias=bias,
-                                          
-                                          input_quant=Uint8ActPerTensorFloat, # generally, input_quant is deactivated
-                                          input_bit_width=activation_bit_width,
-                                          
-                                          weight_bit_width=weight_bit_width, 
-                                          weight_scaling_per_output_channel=weight_scaling_per_output_channel)
+    def forward(self, x: torch.Tensor):
+        return SilhouetteActivation.apply(x, self.theta)
     
     
-    def forward(self, x: torch.Tensor, debug: bool = False):
-        assert x.dim() == 4
-        std = torch.std(x, dim=[2, 3])
-        mask = torch.ge(std, self.threshold)
-        mask = mask.unsqueeze(2).unsqueeze(3)
-        x = x.masked_fill(~mask, 0)
-        y = self.conv_layer(x)
-        if debug:
-            return y, x
-        return y
+    
+class QuantSilhouetteReLU(QuantNLAL):
+    def __init__(self,
+                 input_quant=None,
+                 act_quant=Uint8ActPerTensorFloat,
+                 return_quant_tensor=False,
+                 **kwargs
+                ):
+        QuantNLAL.__init__(
+            self,
+            act_impl=SilhouetteReLU,
+            passthrough_act=True,
+            input_quant=input_quant,
+            act_quant=act_quant,
+            return_quant_tensor=return_quant_tensor,
+            **kwargs
+        )
